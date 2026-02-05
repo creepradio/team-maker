@@ -1,3 +1,8 @@
+import streamlit as st
+
+# ✅ Streamlit은 set_page_config가 "가장 먼저" 실행되는 게 안전합니다.
+st.set_page_config(page_title="농구 자동 팀 편성기", layout="wide")
+
 import csv
 import json
 import random
@@ -10,7 +15,6 @@ from itertools import combinations
 from io import StringIO
 from urllib.parse import urlparse, parse_qs
 
-import streamlit as st
 import requests
 
 
@@ -62,34 +66,24 @@ def safe_int(x: str) -> int:
 
 def norm_pos(x: str) -> str:
     x = (x or "").strip().upper()
-
-    # 이미 C/F/G라면 OK
     if x in ["C", "F", "G"]:
         return x
-
-    # 한글/영문 풀네임 대응
     if x in ["센터", "CENTER"]:
         return "C"
     if x in ["포워드", "FORWARD"]:
         return "F"
     if x in ["가드", "GUARD"]:
         return "G"
-
-    # 혹시 "C/F"처럼 들어오면 앞글자만
     if "/" in x:
         a = x.split("/")[0].strip().upper()
         if a in ["C", "F", "G"]:
             return a
-
     return x
 
 def norm_tier(x: str) -> str:
     return (x or "").strip()
 
 def try_fix_mojibake(s: str) -> str:
-    """
-    '중위'가 'ì¤ì'처럼 깨진 문자열 복구 시도
-    """
     if not s:
         return s
     if any(ch in s for ch in ["ì", "ë", "ê", "â", "Ã", "¤", "§"]):
@@ -104,45 +98,29 @@ def try_fix_mojibake(s: str) -> str:
 # 3) 링크 자동 변환 (edit 링크 → export csv 링크)
 # =========================
 def to_export_csv_url(sheet_url: str) -> str:
-    """
-    사용자가 아래 중 아무 링크를 넣어도 CSV로 바꿔준다.
-    - edit 링크
-    - share 링크
-    - export 링크
-    - gviz 링크
-    """
     sheet_url = (sheet_url or "").strip()
     if not sheet_url:
         return ""
-
-    # 이미 export format=csv면 그대로 사용
     if "export?format=csv" in sheet_url:
         return sheet_url
-
-    # 이미 gviz csv면 그대로 사용
     if "gviz/tq" in sheet_url and "out:csv" in sheet_url:
         return sheet_url
 
-    # sheets d/{id}/ 형태에서 id 추출
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
     if not m:
-        # publish 링크 등 특수형은 그냥 반환 시도
         return sheet_url
 
     sheet_id = m.group(1)
 
-    # gid 추출: #gid= or gid= 형태
     gid = "0"
     if "#gid=" in sheet_url:
         gid = sheet_url.split("#gid=")[-1].split("&")[0].strip() or "0"
     else:
-        # 혹시 query param에 gid가 있으면
         parsed = urlparse(sheet_url)
         qs = parse_qs(parsed.query)
         if "gid" in qs and qs["gid"]:
             gid = qs["gid"][0]
 
-    # 최종 export CSV 링크 생성
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
 
@@ -150,7 +128,6 @@ def to_export_csv_url(sheet_url: str) -> str:
 # 4) Google Sheets CSV 로드 (헤더 영어/한글 모두 지원 + 인코딩 방지)
 # =========================
 HEADER_ALIASES = {
-    # 영어 표준
     "name": ["name", "이름", "성명", "닉네임"],
     "height": ["height", "키", "신장"],
     "main_pos": ["main_pos", "main", "주포", "주포지션", "정포지션", "포지션"],
@@ -159,69 +136,49 @@ HEADER_ALIASES = {
 }
 
 def unify_header(fieldnames: List[str]) -> List[str]:
-    """
-    CSV 헤더가 한글/영문 섞여도 내부 표준 key로 매핑
-    """
     if not fieldnames:
         return fieldnames
-
-    cleaned = [h.strip().replace("\ufeff", "") for h in fieldnames]  # BOM 제거
-    mapping = {}  # original -> standard
-
-    # 각 표준 key에 대해 alias 탐색
+    cleaned = [h.strip().replace("\ufeff", "") for h in fieldnames]
+    mapping = {}
     for standard_key, aliases in HEADER_ALIASES.items():
         for h in cleaned:
             if h in aliases:
                 mapping[h] = standard_key
-
-    # 매핑되지 않은 헤더는 그대로 두되, DictReader 접근은 매핑된 표준키로 하게 처리할 예정
-    # 그래서 여기서는 "표준 헤더 리스트"를 만들어 반환한다.
-    unified = []
-    for h in cleaned:
-        unified.append(mapping.get(h, h))
-
-    return unified
+    return [mapping.get(h, h) for h in cleaned]
 
 def row_get(row: dict, standard_key: str) -> str:
-    """
-    표준키 기준으로 값을 가져오되,
-    원본 row에 한글키로 들어온 경우도 대비해서 alias 탐색
-    """
-    # 1) 표준키로 바로 있으면 반환
     if standard_key in row and row.get(standard_key) is not None:
         return str(row.get(standard_key))
-
-    # 2) alias로 찾아보기
     for alias in HEADER_ALIASES.get(standard_key, []):
         if alias in row and row.get(alias) is not None:
             return str(row.get(alias))
-
     return ""
 
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_players_from_google_sheet(sheet_link_any: str) -> List[Player]:
-    """
-    사용자 입력 링크(edit/share/export 등)를 받아:
-    1) export csv 링크로 자동 변환
-    2) UTF-8 강제 디코딩
-    3) 헤더 한글/영문 지원
-    """
     if not sheet_link_any or not sheet_link_any.strip():
         raise ValueError("Google Sheets 링크가 비어있습니다.")
 
     csv_url = to_export_csv_url(sheet_link_any.strip())
-
     r = requests.get(csv_url, timeout=15)
     if r.status_code != 200:
         raise ValueError(f"CSV 링크 요청 실패: HTTP {r.status_code}\n링크: {csv_url}")
 
-    # ✅ 인코딩 강제 (UTF-8 + BOM 제거)
-    text = r.content.decode("utf-8-sig", errors="replace")
+    # ✅ HTML이 오면(권한/잘못된 링크) 즉시 에러로 안내
+    content_type = (r.headers.get("Content-Type", "") or "").lower()
+    if "text/html" in content_type:
+        raise ValueError(
+            "구글시트 CSV를 불러오지 못했습니다.\n"
+            "원인: 시트가 비공개이거나 CSV 링크가 아닌 페이지로 연결됩니다.\n\n"
+            "해결:\n"
+            "1) 시트 공유 권한을 '링크가 있는 모든 사용자: 뷰어'로 변경\n"
+            "2) 또는 파일 → 웹에 게시(Publish to web) → CSV 링크 사용"
+        )
 
+    text = r.content.decode("utf-8-sig", errors="replace")
     f = StringIO(text)
     reader = csv.DictReader(f)
 
-    # ✅ 헤더 통합(한글/영문 모두 표준키로)
     if reader.fieldnames:
         reader.fieldnames = unify_header(reader.fieldnames)
 
@@ -238,24 +195,18 @@ def fetch_players_from_google_sheet(sheet_link_any: str) -> List[Player]:
 
     players: List[Player] = []
     for row in reader:
-        name = (row_get(row, "name") or "").strip()
-        name = try_fix_mojibake(name)
+        name = try_fix_mojibake((row_get(row, "name") or "").strip())
         if not name:
             continue
 
-        height_raw = row_get(row, "height")
-        height = safe_int(try_fix_mojibake(height_raw))
+        height_raw = try_fix_mojibake(row_get(row, "height"))
+        height = safe_int(height_raw)
 
-        main_raw = row_get(row, "main_pos")
-        sub_raw = row_get(row, "sub_pos")
-        tier_raw = row_get(row, "skill_tier")
-
-        main_pos = norm_pos(try_fix_mojibake(main_raw))
-        sub_pos_tmp = norm_pos(try_fix_mojibake(sub_raw))
+        main_pos = norm_pos(try_fix_mojibake(row_get(row, "main_pos")))
+        sub_pos_tmp = norm_pos(try_fix_mojibake(row_get(row, "sub_pos")))
         sub_pos = sub_pos_tmp if sub_pos_tmp in ["C", "F", "G"] else None
 
-        tier = norm_tier(try_fix_mojibake(tier_raw))
-
+        tier = norm_tier(try_fix_mojibake(row_get(row, "skill_tier")))
         if tier not in TIER_TO_SCORE:
             raise ValueError(
                 f"{name}의 skill_tier가 잘못되었습니다: '{tier}'\n"
@@ -276,7 +227,7 @@ def fetch_players_from_google_sheet(sheet_link_any: str) -> List[Player]:
     if not players:
         raise ValueError("시트에서 선수 데이터를 읽지 못했습니다. (빈 시트/헤더 오류 가능)")
 
-    # 이름 중복 처리(동명이인 방지)
+    # 동명이인 처리
     seen = {}
     for p in players:
         if p.name not in seen:
@@ -405,10 +356,8 @@ def overall_score(
         h_pen = height_gap_score(teams) * height_weight
 
     base = (skill_gap * 3.0) + (pos_gap * 2.0) + center_penalty + rep_pen + teamset_pen + h_pen
-
     if variety_jitter > 0:
         base += random.random() * variety_jitter
-
     return base
 
 
@@ -546,7 +495,6 @@ def make_teams_search(
     for t in range(trials):
         seed = fixed_seed if fixed_seed is not None else random.randrange(1, 10**9)
         seed = seed + t * 99991
-
         teams = make_teams_once(
             players=players,
             team_count=team_count,
@@ -562,15 +510,8 @@ def make_teams_search(
             variety_jitter=variety_jitter,
         )
         s = overall_score(
-            teams,
-            recent_pairs,
-            recent_teamsets,
-            repeat_weight,
-            teamset_repeat_weight,
-            center_min_weight,
-            use_height_balance,
-            height_weight,
-            variety_jitter,
+            teams, recent_pairs, recent_teamsets, repeat_weight, teamset_repeat_weight,
+            center_min_weight, use_height_balance, height_weight, variety_jitter
         )
         candidates.append((s, teams))
 
@@ -585,7 +526,6 @@ def make_teams_search(
 # =========================
 def assign_roles(team: List[Player]) -> Dict[str, str]:
     roles = {p.name: p.main_pos for p in team}
-
     center_candidates = [p for p in team if p.can_play("C")]
     main_centers = [p for p in center_candidates if p.main_pos == "C"]
 
@@ -595,7 +535,6 @@ def assign_roles(team: List[Player]) -> Dict[str, str]:
     elif center_candidates:
         chosen = sorted(center_candidates, key=lambda x: (x.height, x.skill), reverse=True)[0]
         roles[chosen.name] = "C"
-
     return roles
 
 
@@ -626,20 +565,16 @@ def kakao_text_multi(
         parts = [f"{p.name}({roles.get(p.name, p.main_pos)})" for p in team]
         lines.append("  ".join(parts))
         lines.append("")
-
     if benches:
         lines.append("[후보]")
         for b, t_idx in zip(benches, bench_assign):
             lines.append(f"- TEAM {t_idx+1} 후보: {b.name}({b.main_pos})")
-
     return "\n".join(lines).strip()
 
 
 # =========================
-# 11) Streamlit UI (모바일 최적화)
+# 11) Streamlit UI
 # =========================
-st.set_page_config(page_title="농구 자동 팀 편성기", layout="wide")
-
 st.markdown(
     """
     <style>
@@ -655,7 +590,7 @@ st.markdown(
 )
 
 st.title("농구 자동 팀 편성기")
-st.caption("Google Sheets 연동 · 모바일 최적화 · 팀 자동 밸런싱 · 후보 자동 처리 · 반복 방지")
+st.caption("Google Sheets 연동 · 모바일 최적화 · 체크리스트 참석자 선택 · 후보 자동 처리 · 반복 방지")
 
 
 # 11-1) 링크 입력
@@ -663,6 +598,7 @@ with st.expander("📌 선수 명단 불러오기 (Google Sheets 링크)", expan
     sheet_any_link = st.text_input(
         "구글시트 링크를 붙여넣으세요 (edit 링크도 OK)",
         placeholder="예: https://docs.google.com/spreadsheets/d/.../edit?usp=sharing",
+        key="sheet_link",
     )
     st.caption("팁: edit 링크를 넣어도 자동으로 CSV(export) 링크로 변환됩니다.")
 
@@ -683,7 +619,7 @@ if "history" not in st.session_state:
 history = st.session_state.history
 
 
-# 11-3) 빠른 설정 (모바일에서도 위에서 바로 조절)
+# 11-3) 빠른 설정
 st.subheader("빠른 설정")
 
 c1, c2 = st.columns(2)
@@ -709,7 +645,7 @@ with st.expander("고급 옵션(필요할 때만)"):
     use_seed = st.checkbox("결과 고정(Seed)", value=False)
     seed = st.number_input("Seed 값", 0, 999999, 42, 1) if use_seed else None
 
-# expander를 안 열었을 때를 위한 기본값
+# expander 안 열었을 때 기본
 if "trials" not in locals():
     trials = 50
     top_k_pick = 6
@@ -722,7 +658,7 @@ if "trials" not in locals():
     seed = None
 
 
-# 선수 목록 표시(옵션)
+# 11-4) 선수 목록 표시(옵션)
 with st.expander("선수 전체 목록 보기"):
     st.dataframe(
         [{
@@ -737,45 +673,85 @@ with st.expander("선수 전체 목록 보기"):
     )
 
 
-# 11-4) 참석자 선택
+# =========================
+# ✅ 11-5) 참석자 선택 UI (체크리스트 방식으로 개선)
+# =========================
 st.divider()
-st.subheader("오늘 참석자 선택")
+st.subheader("오늘 참석자 체크")
 
-names = [p.name for p in all_players]
+# 최초 1회: attend_map 초기화 (모든 선수 True로 시작)
+if "attend_map" not in st.session_state:
+    st.session_state.attend_map = {p.name: True for p in all_players}
 
-if "selected_names" not in st.session_state:
-    st.session_state.selected_names = names[:]
+# 선수 명단이 변경되었을 때(구글시트 업데이트) 키 동기화
+current_names = [p.name for p in all_players]
+for n in current_names:
+    if n not in st.session_state.attend_map:
+        st.session_state.attend_map[n] = True
+# 삭제된 선수는 맵에서 제거
+for n in list(st.session_state.attend_map.keys()):
+    if n not in current_names:
+        del st.session_state.attend_map[n]
 
-query = st.text_input("🔎 이름 검색(필터)", value="").strip()
-if query:
-    filtered_names = [n for n in names if query in n]
-else:
-    filtered_names = names[:]
+# 검색
+filter_query = st.text_input("🔎 이름 검색(필터)", value="", key="attend_search").strip()
 
-b1, b2, b3 = st.columns(3)
+def is_visible(name: str) -> bool:
+    return (filter_query in name) if filter_query else True
+
+# 빠른 버튼
+b1, b2, b3, b4 = st.columns(4)
 with b1:
     if st.button("✅ 전체 선택", use_container_width=True):
-        st.session_state.selected_names = names[:]
+        for n in current_names:
+            st.session_state.attend_map[n] = True
 with b2:
     if st.button("🧹 전체 해제", use_container_width=True):
-        st.session_state.selected_names = []
+        for n in current_names:
+            st.session_state.attend_map[n] = False
 with b3:
-    if st.button("🔁 필터만 선택", use_container_width=True):
-        st.session_state.selected_names = filtered_names[:]
+    if st.button("🔎 필터만 선택", use_container_width=True):
+        for n in current_names:
+            if is_visible(n):
+                st.session_state.attend_map[n] = True
+with b4:
+    if st.button("🚫 필터만 해제", use_container_width=True):
+        for n in current_names:
+            if is_visible(n):
+                st.session_state.attend_map[n] = False
 
-selected = st.multiselect("참석자", options=names, default=st.session_state.selected_names)
-st.session_state.selected_names = selected
+# 체크리스트 렌더링 (모바일 고려: 2열)
+col_left, col_right = st.columns(2)
 
-today_players = [p for p in all_players if p.name in selected]
+visible_names = [n for n in current_names if is_visible(n)]
+half = (len(visible_names) + 1) // 2
+left_names = visible_names[:half]
+right_names = visible_names[half:]
+
+def render_checks(target_col, names_list: List[str]):
+    with target_col:
+        for n in names_list:
+            st.checkbox(
+                n,
+                value=st.session_state.attend_map.get(n, False),
+                key=f"chk_{n}",
+                on_change=lambda name=n: st.session_state.attend_map.__setitem__(name, st.session_state[f"chk_{name}"]),
+            )
+
+render_checks(col_left, left_names)
+render_checks(col_right, right_names)
+
+# 오늘 참석자 리스트
+today_names = [n for n, v in st.session_state.attend_map.items() if v]
+today_players = [p for p in all_players if p.name in set(today_names)]
 N = len(today_players)
-st.info(f"현재 선택 인원: **{N}명**")
 
+st.info(f"현재 체크 인원: **{N}명**")
 if N < 2:
     st.warning("팀을 만들려면 최소 2명 이상 필요합니다.")
     st.stop()
 
-
-# 11-5) 반복 방지 준비
+# 반복 방지 준비
 recent_pairs = set()
 recent_teamsets = set()
 if use_repeat_guard and len(history) > 0:
@@ -783,14 +759,16 @@ if use_repeat_guard and len(history) > 0:
     recent_teamsets = history_teamsets_from_last_n(history, n_history)
 
 
+# =========================
 # 11-6) 팀 생성
+# =========================
 st.divider()
 generate = st.button("🏀 팀 생성하기", type="primary", use_container_width=True)
 
 if generate:
     team_count_int = int(team_count)
 
-    # 균등 팀 유지: 남는 인원은 후보
+    # 남는 인원은 후보로 분리 (팀당 동일 인원)
     base_size = N // team_count_int
     target_total = base_size * team_count_int
     bench_count = N - target_total
@@ -903,3 +881,4 @@ if generate:
             st.session_state.history = []
             save_history_to_file([])
             st.success("기록을 초기화했습니다.")
+
